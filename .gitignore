@@ -11,3 +11,6 @@ htmlcov/
 *.egg-info/
 build/
 dist/
+.idea
+.github
+.audit
