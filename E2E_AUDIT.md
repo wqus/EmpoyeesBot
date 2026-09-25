@@ -1,5 +1,7 @@
 # E2E / use-case audit
 
+> Historical notes. Current real PostgreSQL and Telegram verification: [2026-09-24 audit](docs/AUDIT_2026-09-24.md).
+
 ## Pipeline used
 1. Static import/compile and ORM mapping validation.
 2. Registration and access-control review.

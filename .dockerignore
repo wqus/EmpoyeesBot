@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+.venv
+.audit
+.idea
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+tests
+docs

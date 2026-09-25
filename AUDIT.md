@@ -1,5 +1,7 @@
 # Audit result
 
+> Historical notes. Current verified results: [2026-09-24 audit](docs/AUDIT_2026-09-24.md). Environment limitations below describe earlier runs.
+
 Fixed critical processing-path issues:
 - lesson-test FSM is now fully wired to `LessonTestService.finish`;
 - final exam now sends all 30 questions, validates ownership on every answer, resumes an unfinished attempt, finalizes at 27/30 and supports retry;

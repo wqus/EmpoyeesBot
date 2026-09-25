@@ -30,7 +30,7 @@ class InviteService:
         if tg != settings.owner_telegram_id:
             raise AppError('Только владелец')
 
-    async def create(self, tg, creator):
+    async def create(self, tg, creator: int | None = None):
         self.owner(tg)
         raw = secrets.token_urlsafe(32)
         h = hashlib.sha256(raw.encode()).hexdigest()
@@ -44,8 +44,8 @@ class InviteService:
         now = datetime.now(timezone.utc)
         if not inv or inv.used_at or inv.revoked_at or (inv.expires_at <= now):
             raise AppError('Приглашение недействительно')
-        if not await self.users.by_id(user_id):
-            raise AppError('Пользователь не найден')
+        from app.services.locking import active_employee
+        await active_employee(self.s, user_id)
         admin = await self.admins.by_user(user_id)
         if admin is None:
             admin = await self.admins.create(user_id)

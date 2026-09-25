@@ -9,20 +9,6 @@ from app.services.admin_crud import AdminCrudService
 URL = os.getenv('TEST_DATABASE_URL')
 pytestmark = pytest.mark.skipif(not URL, reason='TEST_DATABASE_URL is not configured')
 
-@pytest.fixture
-async def session():
-    engine = create_async_engine(URL)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    async with factory() as s:
-        yield s
-        await s.rollback()
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    await engine.dispose()
-
 @pytest.mark.asyncio
 async def test_registration_learning_test_unlock_and_exam(session):
     studio = Studio(name='Studio A', is_active=True)
@@ -51,13 +37,16 @@ async def test_registration_learning_test_unlock_and_exam(session):
     qs = await LessonTestService(session).questions(second.id)
     await LessonTestService(session).finish(user.id, second.id, [(qs[0].id, qs[0].options[0].id)])
     for i in range(30):
-        q = ExamQuestion(lesson_id=first.id, text=f'Exam {i}', is_active=True)
+        topic_id = second.id if i == 0 else first.id
+        q = ExamQuestion(lesson_id=topic_id, text=f'Exam {i}', is_active=True)
         session.add(q)
         await session.flush()
         session.add_all([ExamAnswerOption(question_id=q.id, text='yes', is_correct=True, position=1), ExamAnswerOption(question_id=q.id, text='no', is_correct=False, position=2)])
     await session.flush()
     exam = ExamService(session)
     attempt = await exam.start(user.id)
+    slots = await exam.e.answers(attempt.id)
+    assert {slot.question.lesson_id for slot in slots} == {first.id, second.id}
     for _ in range(30):
         slot = await exam.current(user.id, attempt.id)
         assert slot is not None
@@ -79,3 +68,26 @@ async def test_published_lesson_cannot_be_structurally_edited(session):
     await admin.toggle_lesson(lesson.id)
     with pytest.raises(Exception):
         await admin.add_lesson_text(lesson.id, 'Mutation')
+
+@pytest.mark.asyncio
+async def test_owner_invite_without_employee_row_and_admin_accept(session):
+    from app.core.config import settings
+    from app.services.admin import InviteService
+    from app.database.models import Admin, AdminInvite
+    from sqlalchemy import select
+
+    studio = Studio(name='Invite Studio', is_active=True)
+    session.add(studio)
+    await session.flush()
+    raw = await InviteService(session).create(settings.owner_telegram_id, None)
+    invite = await session.scalar(select(AdminInvite).order_by(AdminInvite.id.desc()))
+    assert invite is not None
+    assert invite.created_by_user_id is None
+
+    user = User(telegram_id=2002, full_name='Invited Admin', studio_id=studio.id, is_active=True)
+    session.add(user)
+    await session.flush()
+    await InviteService(session).accept(raw, user.id)
+    admin = await session.scalar(select(Admin).where(Admin.user_id == user.id))
+    assert admin is not None
+    assert invite.used_by_user_id == user.id

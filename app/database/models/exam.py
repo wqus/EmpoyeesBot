@@ -1,5 +1,8 @@
 from datetime import datetime
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Text, UniqueConstraint, func, text as sql_text
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .learning import Lesson
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Text, UniqueConstraint, func, text as sql_text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database.base import Base
 from .mixins import TimestampMixin
@@ -24,6 +27,11 @@ class ExamAnswerOption(TimestampMixin, Base):
 
 class ExamAttempt(Base):
     __tablename__ = 'exam_attempts'
+    __table_args__ = (
+        CheckConstraint('total_count = 30 AND correct_count BETWEEN 0 AND total_count', name='ck_exam_score'),
+        Index('uq_exam_active_user', 'user_id', unique=True, postgresql_where=sql_text('passed IS NULL')),
+        Index('ix_exam_attempts_user_id', 'user_id'),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'))
     correct_count: Mapped[int] = mapped_column(server_default='0')

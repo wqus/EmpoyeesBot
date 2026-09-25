@@ -22,6 +22,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["sh","-c","alembic upgrade head && python -m app.seed_oasis && python -m app.main"]
+    command: ["sh","-c","alembic upgrade head && python -m app.seed_oasis && exec python -m app.main"]
 volumes:
   postgres_data:

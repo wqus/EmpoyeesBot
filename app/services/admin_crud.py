@@ -4,23 +4,28 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import selectinload
 from app.core.config import settings
 from app.core.exceptions import AppError, ContentValidationError
-from app.database.models import User, Studio, Lesson, LessonMedia, LessonQuestion, LessonAnswerOption, LessonProgress, LessonTestAttempt, LessonTestAnswer, ExamQuestion, ExamAnswerOption, ExamAnswer, ExamAttempt, MaterialCategory, Material, MaterialMedia, MediaType
+from app.database.models import User, Studio, Lesson, LessonMedia, LessonQuestion, LessonAnswerOption, LessonProgress, LessonTestAttempt, LessonTestAnswer, ExamQuestion, ExamAnswerOption, ExamAnswer, ExamAttempt, MaterialCategory, Material, MaterialMedia, MediaType, LessonProgressStatus
 from app.services.admin import ContentValidator
+from app.services.locking import catalog_write
 
 class AdminCrudService:
 
     def __init__(self, session):
         self.s = session
 
-    async def users(self, studio_id: int | None=None):
+    async def users(self, studio_id: int | None=None, *, limit=50, offset=0):
         stmt = select(User).options(selectinload(User.studio)).order_by(User.full_name, User.id)
         if studio_id is not None:
             stmt = stmt.where(User.studio_id == studio_id)
-        return list((await self.s.scalars(stmt)).all())
+        return list((await self.s.scalars(stmt.offset(offset).limit(limit))).all())
+
+    async def user_count(self):
+        return await self.s.scalar(select(func.count(User.id))) or 0
 
     async def user(self, user_id: int):
         return await self.s.scalar(select(User).where(User.id == user_id).options(selectinload(User.studio)))
 
+    @catalog_write
     async def toggle_user(self, user_id: int):
         user = await self.user(user_id)
         if not user:
@@ -44,8 +49,21 @@ class AdminCrudService:
             weak = Counter((x.question.lesson.title for x in aa if x.is_correct is False))
         return (u, progress, tests, exams, weak)
 
-    async def exam_history(self, limit=50):
-        return list((await self.s.execute(select(ExamAttempt, User).join(User).where(ExamAttempt.passed.is_not(None)).order_by(ExamAttempt.id.desc()).limit(limit))).all())
+    async def exam_history(self, limit=50, offset=0):
+        stmt = (
+            select(ExamAttempt, User)
+            .join(User)
+            .where(ExamAttempt.passed.is_not(None))
+            .order_by(ExamAttempt.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        return list((await self.s.execute(stmt)).all())
+
+    async def exam_history_count(self):
+        return await self.s.scalar(
+            select(func.count(ExamAttempt.id)).where(ExamAttempt.passed.is_not(None))
+        ) or 0
 
     async def studios(self):
         return list((await self.s.scalars(select(Studio).order_by(Studio.name))).all())
@@ -53,9 +71,10 @@ class AdminCrudService:
     async def studio(self, studio_id: int):
         return await self.s.get(Studio, studio_id)
 
+    @catalog_write
     async def create_studio(self, name: str):
         name = name.strip()
-        if len(name) < 2:
+        if not 2 <= len(name) <= 255:
             raise AppError('Название слишком короткое')
         duplicate = await self.s.scalar(select(Studio.id).where(func.lower(Studio.name) == name.lower()))
         if duplicate:
@@ -65,12 +84,13 @@ class AdminCrudService:
         await self.s.flush()
         return obj
 
+    @catalog_write
     async def rename_studio(self, studio_id: int, name: str):
         obj = await self.studio(studio_id)
         if not obj:
             raise AppError('Студия не найдена')
         name = name.strip()
-        if len(name) < 2:
+        if not 2 <= len(name) <= 255:
             raise AppError('Название слишком короткое')
         duplicate = await self.s.scalar(select(Studio.id).where(func.lower(Studio.name) == name.lower(), Studio.id != studio_id))
         if duplicate:
@@ -79,6 +99,7 @@ class AdminCrudService:
         await self.s.flush()
         return obj
 
+    @catalog_write
     async def toggle_studio(self, studio_id: int):
         obj = await self.studio(studio_id)
         if not obj:
@@ -87,15 +108,27 @@ class AdminCrudService:
         await self.s.flush()
         return obj
 
+    @catalog_write
+    async def delete_studio(self, studio_id: int):
+        obj = await self.studio(studio_id)
+        if not obj:
+            raise AppError('Студия не найдена')
+        users_count = await self.s.scalar(select(func.count(User.id)).where(User.studio_id == studio_id)) or 0
+        if users_count:
+            raise AppError(f'В студии есть сотрудники: {users_count}. Чтобы не потерять историю обучения, такую студию можно только скрыть.')
+        await self.s.delete(obj)
+        await self.s.flush()
+
     async def lessons(self):
         return list((await self.s.scalars(select(Lesson).order_by(Lesson.position))).all())
 
     async def lesson(self, lesson_id: int):
-        return await self.s.scalar(select(Lesson).where(Lesson.id == lesson_id).options(selectinload(Lesson.media), selectinload(Lesson.questions).selectinload(LessonQuestion.options)))
+        return await self.s.scalar(select(Lesson).where(Lesson.id == lesson_id).execution_options(populate_existing=True).options(selectinload(Lesson.media), selectinload(Lesson.questions).selectinload(LessonQuestion.options)))
 
+    @catalog_write
     async def create_lesson(self, title: str):
         title = title.strip()
-        if len(title) < 2:
+        if not 2 <= len(title) <= 255:
             raise AppError('Введите название урока')
         pos = (await self.s.scalar(select(func.max(Lesson.position))) or 0) + 1
         obj = Lesson(title=title, position=pos, is_active=False)
@@ -111,6 +144,7 @@ class AdminCrudService:
             raise AppError('Сначала скройте опубликованный урок')
         return obj
 
+    @catalog_write
     async def add_lesson_text(self, lesson_id: int, content: str):
         lesson = await self._editable_lesson(lesson_id)
         content = content.strip()
@@ -122,7 +156,10 @@ class AdminCrudService:
         await self.s.flush()
         return obj
 
+    @catalog_write
     async def add_lesson_media(self, lesson_id: int, media_type: MediaType, file_id: str, caption: str | None=None):
+        if media_type not in {MediaType.PHOTO, MediaType.VIDEO, MediaType.DOCUMENT} or not file_id or len(file_id) > 512:
+            raise AppError('Ожидается фото, видео или документ')
         lesson = await self._editable_lesson(lesson_id)
         pos = max((x.position for x in lesson.media), default=0) + 1
         obj = LessonMedia(lesson_id=lesson.id, media_type=media_type, telegram_file_id=file_id, content=caption, position=pos)
@@ -130,10 +167,13 @@ class AdminCrudService:
         await self.s.flush()
         return obj
 
+    @catalog_write
     async def add_lesson_question(self, lesson_id: int, text: str, options: list[str], correct_index: int):
         lesson = await self._editable_lesson(lesson_id)
         text = text.strip()
-        options = [x.strip() for x in options if x.strip()]
+        options = [x.strip() for x in options]
+        if any(not x for x in options):
+            raise AppError("Варианты не могут быть пустыми")
         if not text or len(options) < 2 or correct_index < 0 or (correct_index >= len(options)):
             raise AppError('Некорректный вопрос')
         pos = max((x.position for x in lesson.questions), default=0) + 1
@@ -148,6 +188,7 @@ class AdminCrudService:
     async def lesson_media_item(self, media_id: int):
         return await self.s.get(LessonMedia, media_id)
 
+    @catalog_write
     async def edit_lesson_media_text(self, lesson_id: int, media_id: int, content: str):
         await self._editable_lesson(lesson_id)
         item = await self.s.get(LessonMedia, media_id)
@@ -160,6 +201,30 @@ class AdminCrudService:
         await self.s.flush()
         return item
 
+    @catalog_write
+    async def edit_lesson_media_caption(self, lesson_id: int, media_id: int, content: str | None):
+        await self._editable_lesson(lesson_id)
+        item = await self.s.get(LessonMedia, media_id)
+        if not item or item.lesson_id != lesson_id or item.media_type == MediaType.TEXT:
+            raise AppError('Медиа-блок не найден')
+        item.content = (content or '').strip() or None
+        await self.s.flush()
+        return item
+
+    @catalog_write
+    async def replace_lesson_media(self, lesson_id: int, media_id: int, media_type: MediaType, file_id: str):
+        await self._editable_lesson(lesson_id)
+        item = await self.s.get(LessonMedia, media_id)
+        if not item or item.lesson_id != lesson_id or item.media_type == MediaType.TEXT:
+            raise AppError('Медиа-блок не найден')
+        if media_type == MediaType.TEXT or not file_id:
+            raise AppError('Ожидается фото, видео или документ')
+        item.media_type = media_type
+        item.telegram_file_id = file_id
+        await self.s.flush()
+        return item
+
+    @catalog_write
     async def delete_lesson_media(self, lesson_id: int, media_id: int):
         lesson = await self._editable_lesson(lesson_id)
         item = await self.s.get(LessonMedia, media_id)
@@ -177,8 +242,9 @@ class AdminCrudService:
         await self.s.flush()
 
     async def lesson_question(self, question_id: int):
-        return await self.s.scalar(select(LessonQuestion).where(LessonQuestion.id == question_id).options(selectinload(LessonQuestion.options)))
+        return await self.s.scalar(select(LessonQuestion).where(LessonQuestion.id == question_id).execution_options(populate_existing=True).options(selectinload(LessonQuestion.options)))
 
+    @catalog_write
     async def edit_lesson_question_text(self, lesson_id: int, question_id: int, text: str):
         await self._editable_lesson(lesson_id)
         q = await self.lesson_question(question_id)
@@ -194,6 +260,7 @@ class AdminCrudService:
         await self.s.flush()
         return q
 
+    @catalog_write
     async def edit_lesson_question_options(self, lesson_id: int, question_id: int, options: list[str], correct_index: int):
         await self._editable_lesson(lesson_id)
         q = await self.lesson_question(question_id)
@@ -202,7 +269,9 @@ class AdminCrudService:
         used = await self.s.scalar(select(func.count(LessonTestAnswer.id)).where(LessonTestAnswer.question_id == question_id)) or 0
         if used:
             raise AppError('Вопрос уже использовался. Отключите его и создайте новую версию.')
-        options = [x.strip() for x in options if x.strip()]
+        options = [x.strip() for x in options]
+        if any(not x for x in options):
+            raise AppError("Варианты не могут быть пустыми")
         if len(options) < 2 or correct_index not in range(len(options)):
             raise AppError('Некорректные варианты')
         await self.s.execute(delete(LessonAnswerOption).where(LessonAnswerOption.question_id == question_id))
@@ -211,6 +280,44 @@ class AdminCrudService:
         await self.s.flush()
         return q
 
+    @catalog_write
+    async def edit_lesson_option_text(self, lesson_id: int, question_id: int, option_id: int, text: str):
+        await self._editable_lesson(lesson_id)
+        q = await self.lesson_question(question_id)
+        if not q or q.lesson_id != lesson_id: raise AppError('Вопрос не найден')
+        if await self.s.scalar(select(func.count(LessonTestAnswer.id)).where(LessonTestAnswer.question_id == question_id)) or 0: raise AppError('По вопросу уже есть история. Отключите его и создайте новую версию.')
+        option = next((x for x in q.options if x.id == option_id), None)
+        if not option: raise AppError('Вариант ответа не найден')
+        text = text.strip()
+        if not text: raise AppError('Вариант ответа не может быть пустым')
+        option.text = text; await self.s.flush(); return option
+
+    @catalog_write
+    async def set_lesson_correct_option(self, lesson_id: int, question_id: int, option_id: int):
+        await self._editable_lesson(lesson_id); q = await self.lesson_question(question_id)
+        if not q or q.lesson_id != lesson_id: raise AppError('Вопрос не найден')
+        if await self.s.scalar(select(func.count(LessonTestAnswer.id)).where(LessonTestAnswer.question_id == question_id)) or 0: raise AppError('По вопросу уже есть история. Отключите его и создайте новую версию.')
+        if not any(x.id == option_id for x in q.options): raise AppError('Вариант ответа не найден')
+        for x in q.options: x.is_correct = x.id == option_id
+        await self.s.flush()
+
+    @catalog_write
+    async def delete_lesson_option(self, lesson_id: int, question_id: int, option_id: int):
+        await self._editable_lesson(lesson_id); q = await self.lesson_question(question_id)
+        if not q or q.lesson_id != lesson_id: raise AppError('Вопрос не найден')
+        if await self.s.scalar(select(func.count(LessonTestAnswer.id)).where(LessonTestAnswer.question_id == question_id)) or 0: raise AppError('По вопросу уже есть история. Отключите его и создайте новую версию.')
+        option = next((x for x in q.options if x.id == option_id), None)
+        if not option: raise AppError('Вариант ответа не найден')
+        if len(q.options) <= 2: raise AppError('У вопроса должно остаться минимум два варианта ответа.')
+        if option.is_correct: raise AppError('Сначала назначьте правильным другой вариант, затем удалите этот.')
+        await self.s.delete(option); await self.s.flush()
+        remaining = sorted((x for x in q.options if x.id != option_id), key=lambda x: x.position)
+        for n, x in enumerate(remaining, 1): x.position = 100000 + n
+        await self.s.flush()
+        for n, x in enumerate(remaining, 1): x.position = n
+        await self.s.flush()
+
+    @catalog_write
     async def toggle_lesson_question(self, lesson_id: int, question_id: int):
         await self._editable_lesson(lesson_id)
         q = await self.lesson_question(question_id)
@@ -224,6 +331,7 @@ class AdminCrudService:
         await self.s.flush()
         return q
 
+    @catalog_write
     async def delete_lesson_question(self, lesson_id: int, question_id: int):
         lesson = await self._editable_lesson(lesson_id)
         q = await self.lesson_question(question_id)
@@ -242,16 +350,20 @@ class AdminCrudService:
             x.position = n
         await self.s.flush()
 
+    @catalog_write
     async def rename_lesson(self, i, title):
         x = await self._editable_lesson(i)
         title = title.strip()
-        if len(title) < 2:
+        if not 2 <= len(title) <= 255:
             raise AppError('Введите название урока')
         x.title = title
         await self.s.flush()
         return x
 
+    @catalog_write
     async def move_lesson(self, i, d):
+        if d not in (-1, 1):
+            raise AppError('Некорректное направление')
         x = await self._editable_lesson(i)
         o = await self.s.scalar(select(Lesson).where(Lesson.position == x.position + d))
         if not o:
@@ -262,7 +374,7 @@ class AdminCrudService:
         if history:
             raise AppError('Порядок этих уроков уже зафиксирован у сотрудников. После начала обучения менять последовательность нельзя.')
         old, target = (x.position, o.position)
-        x.position = 1000000
+        x.position = (await self.s.scalar(select(func.max(type(x).position))) or 0) + 1
         await self.s.flush()
         o.position = old
         await self.s.flush()
@@ -270,6 +382,7 @@ class AdminCrudService:
         await self.s.flush()
         return x
 
+    @catalog_write
     async def delete_lesson(self, i):
         x = await self._editable_lesson(i)
         used = await self.s.scalar(select(func.count(LessonTestAttempt.id)).where(LessonTestAttempt.lesson_id == i)) or 0
@@ -287,6 +400,7 @@ class AdminCrudService:
             z.position = n
         await self.s.flush()
 
+    @catalog_write
     async def toggle_lesson(self, lesson_id: int):
         lesson = await self.lesson(lesson_id)
         if not lesson:
@@ -299,18 +413,24 @@ class AdminCrudService:
         await self.s.flush()
         return lesson
 
-    async def exam_questions(self):
-        return list((await self.s.scalars(select(ExamQuestion).options(selectinload(ExamQuestion.lesson), selectinload(ExamQuestion.options)).order_by(ExamQuestion.id))).all())
+    async def exam_questions(self, *, limit=50, offset=0):
+        return list((await self.s.scalars(select(ExamQuestion).options(selectinload(ExamQuestion.lesson)).order_by(ExamQuestion.id).offset(offset).limit(limit))).all())
+
+    async def exam_question_counts(self):
+        return (await self.s.execute(select(func.count(ExamQuestion.id), func.count(ExamQuestion.id).filter(ExamQuestion.is_active.is_(True))))).one()
 
     async def exam_question(self, question_id: int):
-        return await self.s.scalar(select(ExamQuestion).where(ExamQuestion.id == question_id).options(selectinload(ExamQuestion.lesson), selectinload(ExamQuestion.options)))
+        return await self.s.scalar(select(ExamQuestion).where(ExamQuestion.id == question_id).execution_options(populate_existing=True).options(selectinload(ExamQuestion.lesson), selectinload(ExamQuestion.options)))
 
+    @catalog_write
     async def create_exam_question(self, lesson_id: int, text: str, options: list[str], correct_index: int):
         lesson = await self.s.get(Lesson, lesson_id)
         if not lesson:
             raise AppError('Тема/урок не найден')
         text = text.strip()
-        options = [x.strip() for x in options if x.strip()]
+        options = [x.strip() for x in options]
+        if any(not x for x in options):
+            raise AppError("Варианты не могут быть пустыми")
         if not text or len(options) < 2 or correct_index not in range(len(options)):
             raise AppError('Некорректный вопрос')
         q = ExamQuestion(lesson_id=lesson_id, text=text, is_active=False)
@@ -327,8 +447,11 @@ class AdminCrudService:
             raise AppError('Вопрос не найден')
         if q.is_active:
             raise AppError('Сначала отключите вопрос')
+        if await self.s.scalar(select(func.count(ExamAnswer.id)).where(ExamAnswer.question_id == i)):
+            raise AppError('По вопросу уже есть история. Создайте новую версию.')
         return q
 
+    @catalog_write
     async def edit_exam_text(self, i, text):
         q = await self._editable_exam(i)
         text = text.strip()
@@ -338,11 +461,14 @@ class AdminCrudService:
         await self.s.flush()
         return q
 
+    @catalog_write
     async def edit_exam_options(self, i, options, correct):
         q = await self._editable_exam(i)
         if await self.s.scalar(select(func.count(ExamAnswer.id)).where(ExamAnswer.question_id == i)) or 0:
             raise AppError('По вопросу уже есть история. Создайте новую версию.')
-        options = [x.strip() for x in options if x.strip()]
+        options = [x.strip() for x in options]
+        if any(not x for x in options):
+            raise AppError("Варианты не могут быть пустыми")
         if len(options) < 2 or correct not in range(len(options)):
             raise AppError('Некорректные варианты')
         await self.s.execute(delete(ExamAnswerOption).where(ExamAnswerOption.question_id == i))
@@ -351,6 +477,40 @@ class AdminCrudService:
         await self.s.flush()
         return q
 
+    @catalog_write
+    async def edit_exam_option_text(self, question_id: int, option_id: int, text: str):
+        q = await self._editable_exam(question_id)
+        if await self.s.scalar(select(func.count(ExamAnswer.id)).where(ExamAnswer.question_id == question_id)) or 0: raise AppError('По вопросу уже есть история. Создайте новую версию.')
+        option = next((x for x in q.options if x.id == option_id), None)
+        if not option: raise AppError('Вариант ответа не найден')
+        text = text.strip()
+        if not text: raise AppError('Вариант ответа не может быть пустым')
+        option.text = text; await self.s.flush(); return option
+
+    @catalog_write
+    async def set_exam_correct_option(self, question_id: int, option_id: int):
+        q = await self._editable_exam(question_id)
+        if await self.s.scalar(select(func.count(ExamAnswer.id)).where(ExamAnswer.question_id == question_id)) or 0: raise AppError('По вопросу уже есть история. Создайте новую версию.')
+        if not any(x.id == option_id for x in q.options): raise AppError('Вариант ответа не найден')
+        for x in q.options: x.is_correct = x.id == option_id
+        await self.s.flush()
+
+    @catalog_write
+    async def delete_exam_option(self, question_id: int, option_id: int):
+        q = await self._editable_exam(question_id)
+        if await self.s.scalar(select(func.count(ExamAnswer.id)).where(ExamAnswer.question_id == question_id)) or 0: raise AppError('По вопросу уже есть история. Создайте новую версию.')
+        option = next((x for x in q.options if x.id == option_id), None)
+        if not option: raise AppError('Вариант ответа не найден')
+        if len(q.options) <= 2: raise AppError('У вопроса должно остаться минимум два варианта ответа.')
+        if option.is_correct: raise AppError('Сначала назначьте правильным другой вариант, затем удалите этот.')
+        await self.s.delete(option); await self.s.flush()
+        remaining = sorted((x for x in q.options if x.id != option_id), key=lambda x: x.position)
+        for n, x in enumerate(remaining, 1): x.position = 100000 + n
+        await self.s.flush()
+        for n, x in enumerate(remaining, 1): x.position = n
+        await self.s.flush()
+
+    @catalog_write
     async def change_exam_lesson(self, i, lid):
         q = await self._editable_exam(i)
         if not await self.s.get(Lesson, lid):
@@ -359,6 +519,7 @@ class AdminCrudService:
         await self.s.flush()
         return q
 
+    @catalog_write
     async def delete_exam_question(self, i):
         q = await self._editable_exam(i)
         if await self.s.scalar(select(func.count(ExamAnswer.id)).where(ExamAnswer.question_id == i)) or 0:
@@ -366,6 +527,7 @@ class AdminCrudService:
         await self.s.delete(q)
         await self.s.flush()
 
+    @catalog_write
     async def toggle_exam_question(self, question_id: int):
         q = await self.exam_question(question_id)
         if not q:
@@ -386,21 +548,26 @@ class AdminCrudService:
     async def category(self, category_id: int):
         return await self.s.get(MaterialCategory, category_id)
 
+    @catalog_write
     async def rename_category(self, category_id: int, name: str):
         x = await self.category(category_id)
         if not x:
             raise AppError('Категория не найдена')
         name = name.strip()
-        if len(name) < 2:
+        if not 2 <= len(name) <= 255:
             raise AppError('Введите название категории')
         x.name = name
         await self.s.flush()
         return x
 
+    @catalog_write
     async def delete_category(self, category_id: int):
         x = await self.category(category_id)
         if not x:
             raise AppError('Категория не найдена')
+        material_count = await self.s.scalar(select(func.count(Material.id)).where(Material.category_id == category_id)) or 0
+        if material_count:
+            raise AppError('Сначала удалите материалы из категории. Категория с материалами не удаляется.')
         await self.s.delete(x)
         await self.s.flush()
         rows = list((await self.s.scalars(select(MaterialCategory).order_by(MaterialCategory.position))).all())
@@ -411,9 +578,10 @@ class AdminCrudService:
             z.position = n
         await self.s.flush()
 
+    @catalog_write
     async def create_category(self, name: str):
         name = name.strip()
-        if len(name) < 2:
+        if not 2 <= len(name) <= 255:
             raise AppError('Введите название категории')
         pos = (await self.s.scalar(select(func.max(MaterialCategory.position))) or 0) + 1
         obj = MaterialCategory(name=name, slug=f'category-{uuid4().hex[:12]}', position=pos, is_active=True)
@@ -425,14 +593,15 @@ class AdminCrudService:
         return list((await self.s.scalars(select(Material).where(Material.category_id == category_id).options(selectinload(Material.media)).order_by(Material.position))).all())
 
     async def material(self, material_id: int):
-        return await self.s.scalar(select(Material).where(Material.id == material_id).options(selectinload(Material.media)))
+        return await self.s.scalar(select(Material).where(Material.id == material_id).execution_options(populate_existing=True).options(selectinload(Material.media)))
 
+    @catalog_write
     async def create_material(self, category_id: int, title: str, content: str | None):
         category = await self.s.get(MaterialCategory, category_id)
         if not category:
             raise AppError('Категория не найдена')
         title = title.strip()
-        if len(title) < 2:
+        if not 2 <= len(title) <= 255:
             raise AppError('Введите название материала')
         pos = (await self.s.scalar(select(func.max(Material.position)).where(Material.category_id == category_id)) or 0) + 1
         obj = Material(category_id=category_id, title=title, content=(content or '').strip() or None, position=pos, is_active=False)
@@ -440,6 +609,7 @@ class AdminCrudService:
         await self.s.flush()
         return obj
 
+    @catalog_write
     async def edit_material_title(self, i, title):
         x = await self.material(i)
         if not x:
@@ -447,12 +617,13 @@ class AdminCrudService:
         if x.is_active:
             raise AppError('Сначала скройте материал')
         title = title.strip()
-        if len(title) < 2:
+        if not 2 <= len(title) <= 255:
             raise AppError('Введите название')
         x.title = title
         await self.s.flush()
         return x
 
+    @catalog_write
     async def edit_material_content(self, i, content):
         x = await self.material(i)
         if not x:
@@ -463,7 +634,10 @@ class AdminCrudService:
         await self.s.flush()
         return x
 
+    @catalog_write
     async def move_material(self, i, d):
+        if d not in (-1, 1):
+            raise AppError('Некорректное направление')
         x = await self.material(i)
         if not x:
             raise AppError('Материал не найден')
@@ -475,7 +649,7 @@ class AdminCrudService:
         if o.is_active:
             raise AppError('Сначала скройте соседний материал')
         old, target = (x.position, o.position)
-        x.position = 1000000
+        x.position = (await self.s.scalar(select(func.max(type(x).position))) or 0) + 1
         await self.s.flush()
         o.position = old
         await self.s.flush()
@@ -483,6 +657,7 @@ class AdminCrudService:
         await self.s.flush()
         return x
 
+    @catalog_write
     async def delete_material(self, i):
         x = await self.material(i)
         if not x:
@@ -500,7 +675,10 @@ class AdminCrudService:
             z.position = n
         await self.s.flush()
 
+    @catalog_write
     async def add_material_media(self, material_id: int, media_type: MediaType, file_id: str):
+        if media_type not in {MediaType.PHOTO, MediaType.VIDEO, MediaType.DOCUMENT} or not file_id or len(file_id) > 512:
+            raise AppError('Ожидается фото, видео или документ')
         material = await self.material(material_id)
         if not material:
             raise AppError('Материал не найден')
@@ -512,6 +690,7 @@ class AdminCrudService:
         await self.s.flush()
         return obj
 
+    @catalog_write
     async def delete_material_media(self, material_id: int, media_id: int):
         material = await self.material(material_id)
         if not material:
@@ -531,6 +710,7 @@ class AdminCrudService:
             x.position = n
         await self.s.flush()
 
+    @catalog_write
     async def toggle_material(self, material_id: int):
         material = await self.material(material_id)
         if not material:
@@ -548,3 +728,51 @@ class AdminCrudService:
             material.is_active = True
         await self.s.flush()
         return material
+
+    async def lesson_publication_errors(self, lesson_id: int):
+        lesson = await self.lesson(lesson_id)
+        if not lesson:
+            raise AppError('Урок не найден')
+        try:
+            ContentValidator.lesson(lesson)
+            return []
+        except ContentValidationError as exc:
+            return list(exc.errors)
+
+    async def dashboard(self):
+        users_total = await self.s.scalar(select(func.count(User.id))) or 0
+        users_active = await self.s.scalar(select(func.count(User.id)).where(User.is_active.is_(True))) or 0
+        lessons = await self.lessons()
+        exams_total = await self.s.scalar(select(func.count(ExamAttempt.id)).where(ExamAttempt.passed.is_not(None))) or 0
+        exams_passed = await self.s.scalar(select(func.count(ExamAttempt.id)).where(ExamAttempt.passed.is_(True))) or 0
+        avg_score = await self.s.scalar(select(func.avg(ExamAttempt.correct_count)).where(ExamAttempt.passed.is_not(None)))
+        per_studio = list((await self.s.execute(
+            select(Studio.id, Studio.name, func.count(User.id))
+            .outerjoin(User, User.studio_id == Studio.id)
+            .group_by(Studio.id, Studio.name)
+            .order_by(Studio.name)
+        )).all())
+        progress_rows = list((await self.s.execute(
+            select(User.studio_id, func.count(LessonProgress.id))
+            .join(User, User.id == LessonProgress.user_id)
+            .join(Lesson, Lesson.id == LessonProgress.lesson_id)
+            .where(LessonProgress.status == LessonProgressStatus.PASSED, Lesson.is_active.is_(True))
+            .group_by(User.studio_id)
+        )).all())
+        passed_by_studio = dict(progress_rows)
+        return {
+            'users_total': users_total,
+            'users_active': users_active,
+            'lessons_total': len(lessons),
+            'lessons_active': sum(1 for x in lessons if x.is_active),
+            'exams_total': exams_total,
+            'exams_passed': exams_passed,
+            'avg_score': float(avg_score or 0),
+            'per_studio': per_studio,
+            'passed_by_studio': passed_by_studio,
+        }
+
+    async def admin_history(self, limit: int = 100, offset: int = 0):
+        from app.database.models import AdminAction
+        stmt = select(AdminAction).order_by(AdminAction.id.desc()).offset(offset).limit(limit)
+        return list((await self.s.scalars(stmt)).all())

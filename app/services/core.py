@@ -1,9 +1,14 @@
 import math
+import random
+import hashlib
+import json
 from collections import Counter
 from datetime import datetime, timezone
 from app.core.exceptions import AppError
 from app.database.models import *
 from app.repositories.core import *
+from app.services.locking import active_employee, catalog_lock
+from sqlalchemy import text
 
 class RegistrationService:
 
@@ -14,8 +19,9 @@ class RegistrationService:
 
     async def register(self, tg, name, studio_id):
         name = name.strip()
-        if len(name) < 2:
+        if not 2 <= len(name) <= 255:
             raise AppError('Введите корректное ФИО')
+        await self.s.execute(text('SELECT pg_advisory_xact_lock(:key)'), {'key': tg})
         if await self.users.by_tg(tg):
             raise AppError('Уже зарегистрирован')
         studio = await self.studios.by_id(studio_id)
@@ -30,15 +36,20 @@ class LearningService:
         self.r = LearningRepository(s)
 
     async def ensure_progress(self, u):
+        await catalog_lock(self.s, shared=True)
+        await active_employee(self.s, u)
         lessons = await self.r.lessons()
+        existing = {p.lesson_id: p for p in await self.r.progress(u)}
         previous_passed = True
         for lesson in lessons:
-            current = await self.r.progress_one(u, lesson.id)
+            current = existing.get(lesson.id)
             if current is None:
                 status = LessonProgressStatus.AVAILABLE if previous_passed else LessonProgressStatus.LOCKED
                 current = LessonProgress(user_id=u, lesson_id=lesson.id, status=status)
                 self.s.add(current)
-            previous_passed = current.status == LessonProgressStatus.PASSED
+            elif current.status != LessonProgressStatus.PASSED:
+                current.status = LessonProgressStatus.AVAILABLE if previous_passed else LessonProgressStatus.LOCKED
+            previous_passed = previous_passed and current.status == LessonProgressStatus.PASSED
         await self.s.flush()
 
     async def list(self, u):
@@ -66,6 +77,11 @@ class LessonTestService:
     def required(n):
         return math.ceil(n * 0.8)
 
+    @staticmethod
+    def revision(questions):
+        snapshot = [(q.id, q.text, [(o.id, o.text, o.is_correct) for o in q.options]) for q in questions]
+        return hashlib.sha256(json.dumps(snapshot, ensure_ascii=False).encode()).hexdigest()
+
     async def questions(self, l):
         qs = await self.r.questions(l)
         if not qs:
@@ -74,11 +90,14 @@ class LessonTestService:
             raise AppError('Тест настроен некорректно')
         return qs
 
-    async def finish(self, u, l, answers):
+    async def finish(self, u, l, answers, *, expected_revision=None):
+        await LearningService(self.s).lesson(u, l)
         progress = await self.r.progress_one(u, l)
         if not progress or progress.status == LessonProgressStatus.LOCKED:
             raise AppError('Урок недоступен')
         qs = await self.questions(l)
+        if expected_revision is not None and self.revision(qs) != expected_revision:
+            raise AppError('Вопросы теста изменились. Начните новую попытку.')
         by = {q.id: q for q in qs}
         if len(answers) != len(qs) or len({qid for qid, _ in answers}) != len(qs):
             raise AppError('Ответы неполные или содержат дубликаты')
@@ -120,17 +139,34 @@ class ExamService:
 
     async def start(self, u):
         await LearningService(self.s).ensure_progress(u)
+        active = await self.e.active_attempt(u)
+        if active:
+            return active
         lessons = await self.l.lessons()
         progress = await self.l.progress(u)
         passed = {p.lesson_id for p in progress if p.status == LessonProgressStatus.PASSED}
         if not lessons or any((x.id not in passed for x in lessons)):
             raise AppError('Сначала пройдите все уроки')
-        active = await self.e.active_attempt(u)
-        if active:
-            return active
-        if await self.e.count() < self.COUNT:
+        active_questions = await self.e.active_questions()
+        if len(active_questions) < self.COUNT:
             raise AppError('Нужно минимум 30 активных вопросов')
-        questions = await self.e.random(self.COUNT)
+        # В каждом экзамене гарантируем минимум один вопрос по каждой активной теме/уроку.
+        # Остальные места заполняются случайно без повторов.
+        by_lesson = {}
+        for question in active_questions:
+            by_lesson.setdefault(question.lesson_id, []).append(question)
+        missing = [lesson.title for lesson in lessons if lesson.id not in by_lesson]
+        if missing:
+            raise AppError('В банке экзамена нет активных вопросов по темам: ' + ', '.join(missing))
+        if len(lessons) > self.COUNT:
+            raise AppError('Активных тем больше 30, невозможно включить минимум один вопрос по каждой теме')
+        rng = random.SystemRandom()
+        questions = [rng.choice(by_lesson[lesson.id]) for lesson in lessons]
+        selected_ids = {q.id for q in questions}
+        remaining = [q for q in active_questions if q.id not in selected_ids]
+        rng.shuffle(remaining)
+        questions.extend(remaining[: self.COUNT - len(questions)])
+        rng.shuffle(questions)
         if len(questions) != self.COUNT or any((len(q.options) < 2 or sum((bool(o.is_correct) for o in q.options)) != 1 for q in questions)):
             raise AppError('Банк экзамена настроен некорректно')
         a = ExamAttempt(user_id=u, total_count=self.COUNT, correct_count=0, passed=None)
@@ -142,12 +178,14 @@ class ExamService:
         return a
 
     async def current(self, u, a):
+        await active_employee(self.s, u)
         att = await self.e.attempt(a)
         if not att or att.user_id != u or att.passed is not None:
             return None
         return next((x for x in await self.e.answers(a) if x.selected_option_id is None), None)
 
     async def answer(self, u, a, q, o):
+        await active_employee(self.s, u)
         att = await self.e.attempt(a)
         if not att or att.user_id != u or att.passed is not None:
             raise AppError('Попытка недоступна')
@@ -162,6 +200,7 @@ class ExamService:
         await self.s.flush()
 
     async def finish(self, u, a):
+        await active_employee(self.s, u)
         att = await self.e.attempt(a)
         if not att or att.user_id != u or att.passed is not None:
             raise AppError('Попытка недоступна')
@@ -187,7 +226,7 @@ class ResultService:
         progress = await self.l.progress(u)
         exams = await self.e.completed(u)
         last = exams[0] if exams else None
-        weak = []
+        weak = Counter()
         if last:
             answers = await self.e.answers(last.id)
             weak = Counter((x.question.lesson.title for x in answers if x.is_correct is False))

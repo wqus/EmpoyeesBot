@@ -57,6 +57,7 @@ class LessonProgress(Base):
 
 class LessonTestAttempt(Base):
     __tablename__ = 'lesson_test_attempts'
+    __table_args__ = (CheckConstraint('total_count > 0 AND correct_count BETWEEN 0 AND total_count', name='ck_lesson_test_score'),)
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'))
     lesson_id: Mapped[int] = mapped_column(ForeignKey('lessons.id', ondelete='RESTRICT'))

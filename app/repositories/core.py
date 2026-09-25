@@ -87,11 +87,15 @@ class ExamRepository:
         stmt = select(ExamQuestion).where(ExamQuestion.is_active.is_(True)).options(selectinload(ExamQuestion.options)).order_by(func.random()).limit(n)
         return list((await self.s.scalars(stmt)).all())
 
+    async def active_questions(self):
+        stmt = (select(ExamQuestion).join(Lesson, Lesson.id == ExamQuestion.lesson_id).where(ExamQuestion.is_active.is_(True), Lesson.is_active.is_(True)).options(selectinload(ExamQuestion.options), selectinload(ExamQuestion.lesson)).order_by(ExamQuestion.id))
+        return list((await self.s.scalars(stmt)).all())
+
     async def active_attempt(self, u):
         return await self.s.scalar(select(ExamAttempt).where(ExamAttempt.user_id == u, ExamAttempt.passed.is_(None)).order_by(ExamAttempt.id.desc()).limit(1))
 
     async def attempt(self, a):
-        return await self.s.get(ExamAttempt, a)
+        return await self.s.scalar(select(ExamAttempt).where(ExamAttempt.id == a).execution_options(populate_existing=True))
 
     async def answers(self, a):
         stmt = select(ExamAnswer).where(ExamAnswer.attempt_id == a).options(selectinload(ExamAnswer.question).selectinload(ExamQuestion.options), selectinload(ExamAnswer.question).selectinload(ExamQuestion.lesson)).order_by(ExamAnswer.position)
@@ -113,7 +117,7 @@ class MaterialRepository:
         return list((await self.s.scalars(select(MaterialCategory).where(MaterialCategory.is_active.is_(True)).order_by(MaterialCategory.position))).all())
 
     async def materials(self, c):
-        return list((await self.s.scalars(select(Material).where(Material.category_id == c, Material.is_active.is_(True)).order_by(Material.position))).all())
+        return list((await self.s.scalars(select(Material).join(MaterialCategory).where(Material.category_id == c, Material.is_active.is_(True), MaterialCategory.is_active.is_(True)).order_by(Material.position))).all())
 
     async def material(self, i):
-        return await self.s.scalar(select(Material).where(Material.id == i, Material.is_active.is_(True)).options(selectinload(Material.media)))
+        return await self.s.scalar(select(Material).join(MaterialCategory).where(Material.id == i, Material.is_active.is_(True), MaterialCategory.is_active.is_(True)).options(selectinload(Material.media)))

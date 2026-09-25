@@ -7,20 +7,21 @@ from app.core.config import settings
 from app.database.models import Admin, AdminInvite
 from app.repositories.core import UserRepository, AdminRepository
 from app.services.admin import InviteService
+from app.bot.middlewares.state_lock import StateLockMiddleware
 router = Router()
 router.callback_query.filter(IsOwner())
+router.callback_query.middleware(StateLockMiddleware())
 
 @router.callback_query(F.data == 'owner:admins')
 async def panel(c: CallbackQuery):
     await c.answer()
-    await c.message.answer('👑 Управление администраторами', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='➕ Создать invite', callback_data='owner:invite:create')], [InlineKeyboardButton(text='👥 Список админов', callback_data='owner:admins:list')], [InlineKeyboardButton(text='🔗 Активные invite', callback_data='owner:invites:list')]]))
+    await c.message.answer('Управление администраторами', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Создать приглашение', callback_data='owner:invite:create')], [InlineKeyboardButton(text='Список администраторов', callback_data='owner:admins:list')], [InlineKeyboardButton(text='Активные приглашения', callback_data='owner:invites:list')]]))
 
 @router.callback_query(F.data == 'owner:invite:create')
 async def create(c: CallbackQuery, session):
+    # OWNER_TELEGRAM_ID is the bootstrap identity and does not need an employee row.
     u = await UserRepository(session).by_tg(c.from_user.id)
-    if not u:
-        return await c.answer('Сначала зарегистрируйтесь.', show_alert=True)
-    raw = await InviteService(session).create(c.from_user.id, u.id)
+    raw = await InviteService(session).create(c.from_user.id, u.id if u else None)
     me = await c.bot.get_me()
     await c.answer()
     await c.message.answer(f'https://t.me/{me.username}?start=admin_{raw}')
@@ -28,7 +29,7 @@ async def create(c: CallbackQuery, session):
 @router.callback_query(F.data == 'owner:admins:list')
 async def admins(c: CallbackQuery, session):
     items = await AdminRepository(session).all()
-    rows = [[InlineKeyboardButton(text=f'❌ {x.user.full_name}', callback_data=f'owner:admin:remove:{x.user_id}')] for x in items]
+    rows = [[InlineKeyboardButton(text=f'{x.user.full_name}', callback_data=f'd:owner:admin:remove:{x.user_id}')] for x in items]
     await c.answer()
     await c.message.answer('Администраторы:', reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
 
@@ -50,13 +51,13 @@ async def remove(c: CallbackQuery, session):
 async def invites(c: CallbackQuery, session):
     now = datetime.now(timezone.utc)
     items = list((await session.scalars(select(AdminInvite).where(AdminInvite.used_at.is_(None), AdminInvite.revoked_at.is_(None), AdminInvite.expires_at > now).order_by(AdminInvite.id.desc()))).all())
-    rows = [[InlineKeyboardButton(text=f'❌ Отозвать #{x.id}', callback_data=f'owner:invite:revoke:{x.id}')] for x in items]
+    rows = [[InlineKeyboardButton(text=f'Отозвать #{x.id}', callback_data=f'owner:invite:revoke:{x.id}')] for x in items]
     await c.answer()
     await c.message.answer('Активные приглашения:', reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
 
 @router.callback_query(F.data.regexp('^owner:invite:revoke:\\d+$'))
 async def revoke(c: CallbackQuery, session):
-    x = await session.get(AdminInvite, int(c.data.rsplit(':', 1)[1]))
+    x = await session.scalar(select(AdminInvite).where(AdminInvite.id == int(c.data.rsplit(':', 1)[1])).with_for_update())
     if not x or x.used_at or x.revoked_at:
         return await c.answer('Уже недействительно.', show_alert=True)
     x.revoked_at = datetime.now(timezone.utc)
